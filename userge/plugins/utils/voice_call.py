@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 from math import gcd
 from traceback import format_exc
 from typing import List, Tuple
@@ -28,6 +29,8 @@ from pyrogram.types import (
 from pyrogram.types.messages_and_media.message import Str
 
 from youtubesearchpython import VideosSearch
+
+from json.decoder import JSONDecodeError
 
 from userge import userge, Message, pool, filters, get_collection, Config
 from userge.utils import time_formatter, import_ytdl, progress, runcmd
@@ -699,11 +702,11 @@ if LPYCALLS:
     @call.on_stream_end()
     async def handler(_: PyTgCalls, update: Update):
         if isinstance(update, StreamAudioEnded):
-            await handle_queue()
+            await _skip()
 else:
     @call.on_playout_ended
     async def skip_handler(_, __, ___):
-        await handle_queue()
+        await _skip()
 
 
 async def handle_queue():
@@ -725,16 +728,17 @@ async def _skip(clear_queue: bool = False):
         QUEUE.clear()
 
     if not QUEUE:
-        PLAYING = False
         if LPYCALLS:
-            await call.change_stream(
-                CHAT_ID,
-                AudioPiped(
-                    'http://duramecho.com/Misc/SilentCd/Silence01s.mp3'
+            if PLAYING:
+                await call.change_stream(
+                    CHAT_ID,
+                    AudioPiped(
+                        'http://duramecho.com/Misc/SilentCd/Silence01s.mp3'
+                    )
                 )
-            )
         else:
             await call.stop_media()
+        PLAYING = False
         return
 
     shutil.rmtree("temp_music_dir", ignore_errors=True)
@@ -745,6 +749,7 @@ async def _skip(clear_queue: bool = False):
             await tg_down(msg)
         else:
             await yt_down(msg)
+        PLAYING = True
     except Exception as err:
         PLAYING = False
         out = f'**ERROR:** `{err}`'
@@ -780,10 +785,22 @@ async def yt_down(msg: Message):
 
     flags = msg.flags
     is_video = "-v" in flags
-    if is_video:
-        await play_video(stream_link)
-    else:
+    height, width, has_audio, has_video = await get_file_info(stream_link)
+
+    if is_video and has_video:
+        await play_video(stream_link, height, width)
+    elif has_audio:
         await play_audio(stream_link)
+    else:
+        out = "Invalid media found in queue, and skipped"
+        if QUEUE:
+            out += "\n\n`Playing next Song.`"
+        await userge.send_message(
+            CHAT_ID,
+            out,
+            disable_web_page_preview=True
+        )
+        return await _skip()
 
     await message.delete()
 
@@ -833,11 +850,19 @@ async def tg_down(msg: Message):
     if msg.audio:
         duration = msg.audio.duration
     elif msg.video or msg.document:
-        duration = await get_duration(filename)
+        duration = await get_duration(shlex.quote(filename))
     if duration > Config.MAX_DURATION:
         return await _skip()
 
-    if not (msg.audio or await is_having_audio(filename)):
+    height, width, has_audio, has_video = await get_file_info(shlex.quote(filename))
+
+    is_video = file.is_video
+
+    if is_video and has_video:
+        await play_video(filename, height, width)
+    elif has_audio:
+        await play_audio(filename)
+    else:
         out = "Invalid media found in queue, and skipped"
         if QUEUE:
             out += "\n\n`Playing next Song.`"
@@ -847,12 +872,7 @@ async def tg_down(msg: Message):
             disable_web_page_preview=True
         )
         return await _skip()
-    is_video = file.is_video
 
-    if is_video:
-        await play_video(filename)
-    else:
-        await play_audio(filename)
     await message.delete()
 
     BACK_BUTTON_TEXT = (
@@ -870,19 +890,17 @@ async def tg_down(msg: Message):
     CQ_MSG.append(raw_msg)
 
 
-async def play_video(file: str):
+async def play_video(file: str, height: int, width: int):
     if LPYCALLS:
-        width, height = await get_height_and_width(file)
-        if not height or not width:
-            return await play_audio(file)
+        r_width, r_height = resize_ratio(width, height)
         try:
             await call.change_stream(
                 CHAT_ID,
                 AudioVideoPiped(
                     file,
                     video_parameters=VideoParameters(
-                        width,
-                        height,
+                        r_width,
+                        r_height,
                         25
                     )
                 )
@@ -893,8 +911,8 @@ async def play_video(file: str):
                 AudioVideoPiped(
                     file,
                     video_parameters=VideoParameters(
-                        width,
-                        height,
+                        r_width,
+                        r_height,
                         25
                     )
                 )
@@ -936,51 +954,39 @@ async def get_stream_link(link: str) -> str:
     return out
 
 
-async def is_having_audio(file: str) -> bool:
-    have_audio = False
-    ffprobe_cmd = f"ffprobe -i {file} -v quiet -of json -show_streams"
-    out, err, _, _ = await runcmd(ffprobe_cmd)
-    if err or not out:
-        return have_audio
-    out = json.loads(out)
-    streams = out.get("streams")
-    if not streams:
-        return have_audio
-    for stream in streams:
-        codec = stream.get("codec_type")
-        if codec and codec == "audio":
-            have_audio = True
-            break
-    return have_audio
-
-
 async def get_duration(file: str) -> int:
     dur = 0
-    cmd = f"ffprobe -i {file} -v error -show_entries format=duration -of json -select_streams v:0"
-    out, _, _, _ = await runcmd(cmd)
+    cmd = "ffprobe -i {file} -v error -show_entries format=duration -of json -select_streams v:0"
+    out, _, _, _ = await runcmd(cmd.format(file=file))
     try:
         out = json.loads(out)
-        if out.get("format") and (out.get("format")).get("duration"):
-            dur = int(float((out.get("format")).get("duration")))
-        else:
-            dur = 0
-    except Exception:
+    except JSONDecodeError:
         dur = 0
+    dur = int(float((out.get("format", {})).get("duration", 0)))
     return dur
 
 
-async def get_height_and_width(file: str):
-    cmd = f"ffprobe -v error -select_streams v -show_entries stream=width,height -of json {file}"
-    out, _, _, _ = await runcmd(cmd)
+async def get_file_info(file) -> Tuple[int, int, bool, bool]:
+    cmd = "ffprobe -v error -show_entries stream=width,height,codec_type,codec_name -of json {file}"
+    out, _, _, _ = await runcmd(cmd.format(file=file))
     try:
-        out = json.loads(out)
-        streams = out.get("streams")
-        if streams:
-            return resize_ratio(int(streams[0].get("width", 640)), int(
-                streams[0].get("height", 360)))
-        return 0, 0
-    except BaseException:
-        return 0, 0
+        output = json.loads(out) or {}
+    except JSONDecodeError:
+        output = {}
+    streams = output.get('streams', [])
+    width, height, have_audio, have_video = 0, 0, False, False
+    for stream in streams:
+        if (
+            stream.get('codec_type', '') == 'video'
+            and stream.get('codec_name', '') not in ['png', 'jpeg', 'jpg']
+        ):
+            width = int(stream.get('width', 0))
+            height = int(stream.get('height', 0))
+            if width and height:
+                have_video = True
+        elif stream.get('codec_type', '') == "audio":
+            have_audio = True
+    return height, width, have_audio, have_video
 
 
 def _get_yt_link(msg: Message) -> str:
