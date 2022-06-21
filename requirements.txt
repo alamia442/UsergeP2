@@ -1,5 +1,5 @@
 dnspython
 heroku3
 motor
-pyrogram>=2.0.27
+git+https://github.com/pyrogram/pyrogram
 tgcrypto
